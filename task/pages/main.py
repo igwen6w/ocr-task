@@ -7,6 +7,7 @@ from typing import List, Dict
 # 在文件开头添加
 import aiohttp
 import aiomysql
+import json
 
 class OCRProcessor:
     def __init__(self):
@@ -63,7 +64,7 @@ class OCRProcessor:
                     response_text = await response.text()
                     if response.status == 200:
                         try:
-                            res = await response.json(content=response_text)
+                            res = json.loads(response_text)
                             return res.get('data')
                         except Exception as json_error:
                             print(f"JSON解析错误: {str(json_error)}\n响应内容: {response_text[:200]}...")
