@@ -1,0 +1,21 @@
+app:
+  resource_path: resources
+  
+database:
+  host: localhost
+  user: your_username
+  password: your_password
+  database: your_database
+
+ocr:
+  url: http://ocr.image.edoc.com.cn/api/ocr
+  options:
+    language: models/config_chinese.txt
+    cls: true
+    limit_side_len: 999999
+    parser: none
+    format: text
+
+task:
+  wait_time: 60  # 无任务时等待时间（秒）
+  request_interval: 1  # 请求间隔时间（秒）
