@@ -1,9 +1,6 @@
-import requests
-import json
-import mysql.connector
+import asyncio
 import base64
 import os
-import time
 import yaml
 from typing import List, Dict
 
@@ -18,7 +15,10 @@ class OCRProcessor:
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        self.db_config = self.config['database']
+        # 修改数据库配置，将 database 改为 db
+        self.db_config = self.config['database'].copy()
+        if 'database' in self.db_config:
+            self.db_config['db'] = self.db_config.pop('database')
         self.ocr_url = self.config['ocr']['url']
         self.headers = {
             'Content-Type': 'application/json'

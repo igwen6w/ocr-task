@@ -1,14 +1,15 @@
 app:
-  resource_path: resources
+  resource_path: /app/public
   
 database:
-  host: localhost
-  user: your_username
-  password: your_password
-  database: your_database
+  host: mysql
+  user: user
+  password: pass
+  database: database
+  db: database
 
 ocr:
-  url: http://ocr.image.edoc.com.cn/api/ocr
+  url: http://ocr_image-umiocr-1:1224/api/ocr
   options:
     language: models/config_chinese.txt
     cls: true
