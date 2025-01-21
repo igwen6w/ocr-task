@@ -60,11 +60,17 @@ class OCRProcessor:
 
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.ocr_url, headers=self.headers, json=payload) as response:
+                    response_text = await response.text()
                     if response.status == 200:
-                        res = await response.json()
-                        return res.get('data')
+                        try:
+                            res = await response.json(content=response_text)
+                            return res.get('data')
+                        except Exception as json_error:
+                            print(f"JSON解析错误: {str(json_error)}\n响应内容: {response_text[:200]}...")
+                            return None
                     else:
-                        raise Exception(f"OCR请求失败: {response.status}")
+                        print(f"OCR请求失败: 状态码 {response.status}\n响应内容: {response_text[:200]}...")
+                        return None
                 
         except Exception as e:
             print(f"处理图片失败: {str(e)}")
