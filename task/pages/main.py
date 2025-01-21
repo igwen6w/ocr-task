@@ -61,7 +61,8 @@ class OCRProcessor:
             async with aiohttp.ClientSession() as session:
                 async with session.post(self.ocr_url, headers=self.headers, json=payload) as response:
                     if response.status == 200:
-                        return await response.text()
+                        res = await response.json()
+                        return res.get('data')
                     else:
                         raise Exception(f"OCR请求失败: {response.status}")
                 
