@@ -3,7 +3,10 @@ import yaml
 import asyncio
 import aiomysql
 import json
+import logging
 from .umi_ocr import UmiOcr
+
+logger = logging.getLogger('PDFProcessor')
 
 class PDFProcessor:
     def __init__(self):
@@ -18,104 +21,115 @@ class PDFProcessor:
             self.db_config['db'] = self.db_config.pop('database')
         
         self.pool = None  # 数据库连接池
-        self.batch_size = 10  # 批量处理数量
+        self.batch_size = self.config.get('pdf', {}).get('batch_size', 10)  # 从配置文件读取批量处理数量
         self.task_table = 'ww_pdf_task'
         self.task_page = 'ww_document_pages'
+        self.semaphore = asyncio.Semaphore(self.config.get('pdf', {}).get('max_concurrent', 3))  # 并发控制
         
     async def connect_db(self):
         """创建数据库连接池"""
-        self.pool = await aiomysql.create_pool(
-            minsize=1,
-            maxsize=10,
-            **self.db_config
-        )
+        try:
+            self.pool = await aiomysql.create_pool(
+                minsize=1,
+                maxsize=10,
+                **self.db_config
+            )
+            logger.info("数据库连接池创建成功")
+        except Exception as e:
+            logger.error(f"数据库连接池创建失败: {str(e)}")
+            raise
         
-    async def process_pending_tasks(self):
-        """处理待处理任务"""
+    async def get_pending_tasks(self) -> list:
+        """获取待处理任务"""
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cursor:
+                    await cursor.execute(
+                        f"SELECT * FROM {self.task_table} WHERE status = 'pending' LIMIT {self.batch_size}"
+                    )
+                    return await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"获取待处理任务失败: {str(e)}")
+            return []
+                
+    async def get_processing_task(self, task_id: int) -> dict:
+        """获取处理中任务"""
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(
-                    f"SELECT * FROM {self.task_table} WHERE status = 'pending' LIMIT {self.batch_size}"
+                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'processing'",
+                    (task_id,)
                 )
-                tasks = await cursor.fetchall()
-            
-            if tasks:
-                await asyncio.gather(*[
-                    self._process_pending_task(task) for task in tasks
-                ])
-            else:
-                print("No pending tasks found.")
+                return await cursor.fetchone()
+                
+    async def get_downloading_task(self, task_id: int) -> dict:
+        """获取下载中任务"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute(
+                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'downloading'",
+                    (task_id,)
+                )
+                return await cursor.fetchone()
                 
     async def _process_pending_task(self, task):
         """处理单个待处理任务"""
-        try:
-            print(f"Pending task ID: {task['id']}")
-            await self.upload(task['id'])
-            await self.update_status(task['id'], 'processing')
-        except Exception as e:
-            await self.update_status(task['id'], 'error')
-            print(f"Error: {str(e)}")
+        async with self.semaphore:  # 使用信号量控制并发
+            try:
+                logger.info(f"开始处理待处理任务 ID: {task['id']}")
+                await self.upload(task['id'])
+                await self.update_status(task['id'], 'processing')
+            except Exception as e:
+                logger.error(f"处理待处理任务失败 ID {task['id']}: {str(e)}")
+                await self.update_status(task['id'], 'error')
+                raise
             
-    async def process_processing_tasks(self):
-        """处理处理中任务"""
-        async with self.pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute(
-                    f"SELECT * FROM {self.task_table} WHERE status = 'processing' LIMIT {self.batch_size}"
-                )
-                tasks = await cursor.fetchall()
-            
-            if tasks:
-                await asyncio.gather(*[
-                    self._process_processing_task(task) for task in tasks
-                ])
-            else:
-                print("No processing tasks found.")
-                
-    async def _process_processing_task(self, task):
+    async def _process_processing_task(self, task) -> bool:
         """处理单个处理中任务"""
-        try:
-            print(f"Processing task ID: {task['id']}")
-            result = await self.result(task['id'])
-            if result:
-                await self.update_status(task['id'], 'downloading')
-        except Exception as e:
-            await self.update_status(task['id'], 'error')
-            print(f"Error: {str(e)}")
+        async with self.semaphore:  # 使用信号量控制并发
+            try:
+                logger.info(f"开始处理进行中任务 ID: {task['id']}")
+                result = await self.result(task['id'])
+                if result:
+                    await self.update_status(task['id'], 'downloading')
+                return result
+            except Exception as e:
+                logger.error(f"处理进行中任务失败 ID {task['id']}: {str(e)}")
+                await self.update_status(task['id'], 'error')
+                return False
             
-    async def process_downloading_tasks(self):
-        """处理下载任务"""
-        async with self.pool.acquire() as conn:
-            async with conn.cursor(aiomysql.DictCursor) as cursor:
-                await cursor.execute(
-                    f"SELECT * FROM {self.task_table} WHERE status = 'downloading' LIMIT {self.batch_size}"
-                )
-                tasks = await cursor.fetchall()
-            
-            if tasks:
-                await asyncio.gather(*[
-                    self._process_downloading_task(task) for task in tasks
-                ])
-            else:
-                print("No downloading tasks found.")
-                
     async def _process_downloading_task(self, task):
         """处理单个下载任务"""
-        try:
-            print(f"Downloading task ID: {task['id']}")
-            await self.download(task['id'])
-            await self.update_status(task['id'], 'completed')
-        except Exception as e:
-            await self.update_status(task['id'], 'error')
-            print(f"Error: {str(e)}")
+        async with self.semaphore:  # 使用信号量控制并发
+            try:
+                logger.info(f"开始处理下载任务 ID: {task['id']}")
+                await self.download(task['id'])
+                await self.update_status(task['id'], 'completed')
+                logger.info(f"任务处理完成 ID: {task['id']}")
+            except Exception as e:
+                logger.error(f"处理下载任务失败 ID {task['id']}: {str(e)}")
+                await self.update_status(task['id'], 'error')
+                raise
             
     async def update_status(self, task_id: int, status: str):
-        """更新任务状态"""
+        """更新任务状态和最后更新时间"""
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    f"UPDATE {self.task_table} SET status = %s WHERE id = %s",
+                    f"UPDATE {self.task_table} SET status = %s, updated_at = NOW() WHERE id = %s",
                     (status, task_id)
+                )
+                await conn.commit()
+                
+    async def reset_stale_tasks(self, timeout_minutes: int = 30):
+        """重置超时的处理中任务"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE {self.task_table} SET status = 'pending' "
+                    f"WHERE status = 'processing' "
+                    f"AND (updated_at IS NULL OR updated_at < DATE_SUB(NOW(), INTERVAL %s MINUTE))",
+                    (timeout_minutes,)
                 )
                 await conn.commit()
 
@@ -158,11 +172,19 @@ class PDFProcessor:
         """下载处理结果"""
         file = await self.get_pdf_file(task_id)
         if not file:
+            logger.error(f"下载失败：文件不存在 ID {task_id}")
             raise Exception("文件不存在")
             
         if file['task_id'] and file['task_status'] == 'success':
-            await self.download_pdf(file)
-            await self.download_txt(file)
+            try:
+                await asyncio.gather(
+                    self.download_pdf(file),
+                    self.download_txt(file)
+                )
+                logger.info(f"文件下载完成 ID {task_id}")
+            except Exception as e:
+                logger.error(f"文件下载失败 ID {task_id}: {str(e)}")
+                raise
 
     async def get_pdf_file(self, task_id: int) -> dict:
         """获取PDF文件信息"""
