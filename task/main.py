@@ -1,5 +1,6 @@
 import asyncio
 from pages.main import OCRProcessor
+from pdfs.main import PDFTaskRunner
 import yaml
 import os
 
@@ -22,10 +23,11 @@ class TaskManager:
 
     async def process_pdfs(self):
         """处理PDF任务"""
+        from pdfs.main import PDFTaskRunner
+        runner = PDFTaskRunner()
         while True:
             try:
-                # TODO: 实现PDF处理逻辑
-                await asyncio.sleep(5)
+                await runner.run()
             except Exception as e:
                 print(f"PDF处理发生错误: {str(e)}")
                 await asyncio.sleep(5)

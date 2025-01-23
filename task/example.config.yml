@@ -17,6 +17,10 @@ ocr:
     parser: none
     format: text
 
+pdfocr:
+  url: http://ocr-image:1224
+  
+
 task:
   wait_time: 60  # 无任务时等待时间（秒）
   request_interval: 1  # 请求间隔时间（秒）
