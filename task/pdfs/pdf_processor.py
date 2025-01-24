@@ -4,40 +4,25 @@ import asyncio
 import aiomysql
 import json
 import logging
+from pathlib import Path
 from .umi_ocr import UmiOcr
 
 logger = logging.getLogger('PDFProcessor')
 
 class PDFProcessor:
-    def __init__(self):
+    def __init__(self, pool):
+        self.lock = asyncio.Lock()
         # 读取配置文件
         config_path = os.path.join(os.path.dirname(__file__), '..', 'config.yml')
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         
-        # 数据库配置
-        self.db_config = self.config['database'].copy()
-        if 'database' in self.db_config:
-            self.db_config['db'] = self.db_config.pop('database')
-        
-        self.pool = None  # 数据库连接池
+        self.pool = pool  # 使用外部传入的连接池
+        self.umi_ocr = UmiOcr()  # 创建UmiOcr实例
         self.batch_size = self.config.get('pdf', {}).get('batch_size', 10)  # 从配置文件读取批量处理数量
         self.task_table = 'ww_pdf_task'
         self.task_page = 'ww_document_pages'
         self.semaphore = asyncio.Semaphore(self.config.get('pdf', {}).get('max_concurrent', 3))  # 并发控制
-        
-    async def connect_db(self):
-        """创建数据库连接池"""
-        try:
-            self.pool = await aiomysql.create_pool(
-                minsize=1,
-                maxsize=10,
-                **self.db_config
-            )
-            logger.info("数据库连接池创建成功")
-        except Exception as e:
-            logger.error(f"数据库连接池创建失败: {str(e)}")
-            raise
         
     async def get_pending_tasks(self) -> list:
         """获取待处理任务"""
@@ -45,9 +30,14 @@ class PDFProcessor:
             async with self.pool.acquire() as conn:
                 async with conn.cursor(aiomysql.DictCursor) as cursor:
                     await cursor.execute(
-                        f"SELECT * FROM {self.task_table} WHERE status = 'pending' LIMIT {self.batch_size}"
+                        f"SELECT * FROM {self.task_table} "
+                        f"WHERE status = 'pending' "
+                        f"ORDER BY id ASC "
+                        f"LIMIT 1 "
                     )
-                    return await cursor.fetchall()
+                    result = await cursor.fetchall()
+            
+            return result
         except Exception as e:
             logger.error(f"获取待处理任务失败: {str(e)}")
             return []
@@ -57,7 +47,7 @@ class PDFProcessor:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(
-                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'processing'",
+                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'processing' ",
                     (task_id,)
                 )
                 return await cursor.fetchone()
@@ -67,7 +57,7 @@ class PDFProcessor:
         async with self.pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 await cursor.execute(
-                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'downloading'",
+                    f"SELECT * FROM {self.task_table} WHERE id = %s AND status = 'downloading' ",
                     (task_id,)
                 )
                 return await cursor.fetchone()
@@ -140,7 +130,9 @@ class PDFProcessor:
             raise Exception("文件不存在")
             
         if not file['task_id']:
-            result = await UmiOcr().upload(self.config['app']['resource_path'] + file['origin_path'])
+            #PATH
+            file_path = file['origin_path']
+            result = await self.umi_ocr.upload(str(file_path))
             if result['code'] != 100:
                 await self.update_pdf_file_task_error(file['id'], result['data'])
                 raise Exception(result['data'])
@@ -154,7 +146,7 @@ class PDFProcessor:
             raise Exception("文件不存在")
             
         if file['task_id'] and file['task_status'] != 'success':
-            result = await UmiOcr().result(file['task_id'])
+            result = await self.umi_ocr.result(file['task_id'])
             if result['code'] != 100:
                 await self.update_pdf_file_task_error(file['id'], result['data'])
                 raise Exception(result['data'])
@@ -227,38 +219,43 @@ class PDFProcessor:
                 await conn.commit()
 
     async def download_pdf(self, file: dict):
-        """下载PDF文件"""
-        if file['target_path']:
-            return
+        async with self.lock:
+            """下载PDF文件"""
+            if file['target_path']:
+                return
+                
+            result = await self.umi_ocr.download(file['task_id'], ['pdfLayered'])
+            # 等一秒
             
-        result = await UmiOcr().download(file['task_id'], ['pdfLayered'])
-        if result['code'] == 100:
-            file_path = f"{self.config['app']['resource_path']}{file['origin_path']}.layered.pdf"
-            if await UmiOcr().save_file(result['data'], file_path):
-                await self.update_pdf_file_target_path(file, file_path)
+            if result['code'] == 100:
+                #PATH
+                file_path = f"{file['origin_path']}.layered.pdf"
+                if await self.umi_ocr.save_file(result['data'], file_path):
+                    await self.update_pdf_file_target_path(file, file_path)
+                else:
+                    await self.update_pdf_file_task_error(file['id'], '下载文件失败')
+                    raise Exception('下载文件失败')
             else:
-                await self.update_pdf_file_task_error(file['id'], '下载文件失败')
-                raise Exception('下载文件失败')
-        else:
-            await self.update_pdf_file_task_error(file['id'], result['data'])
-            raise Exception(result['data'])
+                await self.update_pdf_file_task_error(file['id'], result['data'])
+                raise Exception(result['data'])
 
     async def download_txt(self, file: dict):
-        """下载TXT文件"""
-        if file['target_txt']:
-            return
-            
-        result = await UmiOcr().download(file['task_id'], ['txt'])
-        if result['code'] == 100:
-            txt = await UmiOcr().get_file_content(result['data'])
-            if txt:
-                await self.update_pdf_file_target_txt(file['id'], txt)
+        async with self.lock:
+            """下载TXT文件"""
+            if file['target_txt']:
+                return
+                
+            result = await self.umi_ocr.download(file['task_id'], ['txt'])
+            if result['code'] == 100:
+                txt = await self.umi_ocr.get_file_content(result['data'])
+                if txt:
+                    await self.update_pdf_file_target_txt(file['id'], txt)
+                else:
+                    await self.update_pdf_file_task_error(file['id'], '下载TXT文件失败')
+                    raise Exception('下载TXT文件失败')
             else:
-                await self.update_pdf_file_task_error(file['id'], '下载TXT文件失败')
-                raise Exception('下载TXT文件失败')
-        else:
-            await self.update_pdf_file_task_error(file['id'], result['data'])
-            raise Exception(result['data'])
+                await self.update_pdf_file_task_error(file['id'], result['data'])
+                raise Exception(result['data'])
 
     async def update_pdf_file_target_path(self, file: dict, target_path: str):
         """更新PDF文件目标路径"""
@@ -282,9 +279,19 @@ class PDFProcessor:
 
     async def close(self):
         """关闭所有资源"""
-        if self.pool:
+        # 关闭UmiOcr的HTTP客户端
+        if hasattr(self, 'umi_ocr'):
+            await self.umi_ocr.close()
+        # 关闭数据库连接池
+        if hasattr(self, 'pool'):
             self.pool.close()
             await self.pool.wait_closed()
-        
-        # 关闭UmiOcr的HTTP客户端
-        await UmiOcr().close()
+
+    def __del__(self):
+        """析构函数，确保资源被正确释放"""
+        if hasattr(self, 'pool') and not self.pool._closed:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.close())
+            else:
+                loop.run_until_complete(self.close())

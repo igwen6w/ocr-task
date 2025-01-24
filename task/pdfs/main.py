@@ -1,9 +1,11 @@
 import asyncio
 import signal
 import logging
+import os
+import yaml
+import aiomysql
 from .pdf_processor import PDFProcessor
 
-# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -11,7 +13,6 @@ logging.basicConfig(
 logger = logging.getLogger('PDFTaskRunner')
 
 async def shutdown(signal, loop):
-    """清理任务并关闭"""
     logger.info(f"收到退出信号 {signal.name}...")
     tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     [task.cancel() for task in tasks]
@@ -21,81 +22,83 @@ async def shutdown(signal, loop):
 
 class PDFTaskRunner:
     _instance = None
-    _lock = asyncio.Lock()
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance.processor = PDFProcessor()
-            cls._instance.loop = None
         return cls._instance
 
-    async def run(self):
-        """运行PDF处理任务"""
-        async with self._lock:
+    def __init__(self):
+        if not hasattr(self, 'config'):
+            config_path = os.path.join(os.path.dirname(__file__), '..', 'config.yml')
+            with open(config_path, 'r', encoding='utf-8') as f:
+                self.config = yaml.safe_load(f)
+            
+            self.db_config = self.config['database'].copy()
+            if 'database' in self.db_config:
+                self.db_config['db'] = self.db_config.pop('database')
+
+    async def _process_task(self, processor, task):
+        logger.info(f"开始处理任务 ID: {task['id']}")
+        await processor._process_pending_task(task)
+        
+        retry_count = 0
+        while retry_count < 3:
             try:
-                await self.processor.connect_db()
-                # 重置超时任务
-                await self.processor.reset_stale_tasks()
-                logger.info("PDF处理器已启动")
+                processing_task = await processor.get_processing_task(task['id'])
+                if not processing_task:
+                    break
+                    
+                if await processor._process_processing_task(processing_task):
+                    downloading_task = await processor.get_downloading_task(task['id'])
+                    if downloading_task:
+                        await processor._process_downloading_task(downloading_task)
+                        logger.info(f"任务 {task['id']} 处理完成")
+                    return True
                 
-                while True:
-                    try:
-                        # 处理待处理任务
-                        pending_tasks = await self.processor.get_pending_tasks()
-                        if pending_tasks:
-                            task = pending_tasks[0]  # 只取一个任务处理
-                            logger.info(f"开始处理任务 ID: {task['id']}")
-                            await self.processor._process_pending_task(task)
-                            
-                            # 监控任务状态直到完成
-                            retry_count = 0
-                            max_retries = 3
-                            while True:
-                                processing_task = await self.processor.get_processing_task(task['id'])
-                                if not processing_task:
-                                    logger.warning(f"任务 {task['id']} 不在处理中状态")
-                                    break
-                                    
-                                try:
-                                    result = await self.processor._process_processing_task(processing_task)
-                                    if result:
-                                        # 任务处理完成，下载结果
-                                        downloading_task = await self.processor.get_downloading_task(task['id'])
-                                        if downloading_task:
-                                            await self.processor._process_downloading_task(downloading_task)
-                                            logger.info(f"任务 {task['id']} 处理完成")
-                                        break
-                                    retry_count = 0  # 重置重试计数
-                                except Exception as e:
-                                    retry_count += 1
-                                    if retry_count >= max_retries:
-                                        logger.error(f"任务 {task['id']} 处理失败，已达到最大重试次数: {str(e)}")
-                                        break
-                                    logger.warning(f"任务 {task['id']} 处理出错，将重试: {str(e)}")
-                                    
-                                await asyncio.sleep(5)  # 每5秒检查一次任务状态
-                        else:
-                            logger.info("没有待处理的任务")
-                            await asyncio.sleep(30)  # 无任务时等待30秒
-                            
-                    except asyncio.CancelledError:
-                        logger.info("正在优雅关闭...")
-                        break
-                    except Exception as e:
-                        logger.error(f"主循环错误: {str(e)}")
-                        await asyncio.sleep(60)  # 出错后等待60秒重试
+                await asyncio.sleep(5)
             except Exception as e:
-                logger.error(f"PDF处理器启动失败: {str(e)}")
+                retry_count += 1
+                logger.warning(f"任务 {task['id']} 处理出错 ({retry_count}/3): {str(e)}")
+                if retry_count >= 3:
+                    logger.error(f"任务 {task['id']} 处理失败: {str(e)}")
+                    return False
+        return False
+
+    async def run(self):
+        while True:
+            try:
+                # 创建连接池和处理器
+                pool = await aiomysql.create_pool(**self.db_config)
+                processor = PDFProcessor(pool)
+                await processor.reset_stale_tasks()
+                
+                # 获取待处理任务
+                pending_tasks = await processor.get_pending_tasks()
+                
+                if not pending_tasks:
+                    logger.info("没有待处理的任务")
+                else:
+                    # 处理任务
+                    await self._process_task(processor, pending_tasks[0])
+                    
+            except asyncio.CancelledError:
+                logger.info("正在优雅关闭...")
+                break
+            except Exception as e:
+                logger.error(f"运行时错误: {str(e)}")
             finally:
-                logger.info("正在关闭PDF处理器...")
-                await self.processor.close()
+                if 'processor' in locals():
+                    await processor.close()
+                if 'pool' in locals():
+                    pool.close()
+                    await pool.wait_closed()
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
     runner = PDFTaskRunner()
     loop = asyncio.get_event_loop()
     
-    # 注册信号处理
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, loop)))
     
