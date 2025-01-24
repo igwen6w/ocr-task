@@ -265,6 +265,10 @@ class PDFProcessor:
                     "UPDATE ww_pdf_file SET target_path = %s WHERE id = %s",
                     (target_path, file['id'])
                 )
+                await cursor.execute(
+                    "INSERT `ww_document_version_files` (version_id, file_path, file_type, document_id) VALUES (%s, %s, %s, %s)",
+                    (file['document_version_id'], target_path, '双层PDF', file['document_id'])
+                )
                 await conn.commit()
 
     async def update_pdf_file_target_txt(self, file_id: int, target_txt: str):
