@@ -3,13 +3,36 @@ from pages.main import OCRProcessor
 from pdfs.main import PDFTaskRunner
 import yaml
 import os
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 class TaskManager:
     def __init__(self):
-        # 读取配置文件
-        config_path = os.path.join(os.path.dirname(__file__), 'config.yml')
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = yaml.safe_load(f)
+        # 从环境变量读取配置
+        self.config = {
+            'database': {
+                'host': os.getenv('DB_HOST'),
+                'port': os.getenv('DB_PORT', '3306'),
+                'user': os.getenv('DB_USER'),
+                'password': os.getenv('DB_PASSWORD'),
+                'database': os.getenv('DB_NAME')
+            },
+            'ocr': {
+                'url': os.getenv('OCR_URL'),
+                'options': {
+                    'language': 'models/config_chinese.txt',
+                    'cls': True,
+                    'limit_side_len': 999999,
+                    'parser': 'none',
+                    'format': 'text'
+                }
+            },
+            'pdfocr': {
+                'url': os.getenv('PDFOCR_URL')
+            }
+        }
 
     async def process_pages(self):
         """处理页面OCR任务"""
